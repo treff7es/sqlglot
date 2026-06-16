@@ -1141,3 +1141,32 @@ class TestLineage(unittest.TestCase):
                 seen.add(id(node))
         for nid in seen:
             self.assertEqual(counts.get(nid, 0), 1)
+
+    def _leaf_names(self, node) -> list[str]:
+        return sorted(n.name for n in node.walk() if not n.downstream)
+
+    def test_lineage_struct_field_path_preserved(self) -> None:
+        # Struct/JSON field access must keep the full path on the leaf, instead
+        # of collapsing to the bare column. Two subfields of the same column
+        # must also stay distinct rather than being deduped into one leaf.
+        node = lineage(
+            "x",
+            "SELECT MIN(widget.metric.a, widget.metric.b) AS x FROM tbl",
+            dialect="bigquery",
+        )
+        self.assertEqual(
+            self._leaf_names(node),
+            ["tbl.widget.metric.a", "tbl.widget.metric.b"],
+        )
+
+    def test_lineage_struct_field_single_and_nested(self) -> None:
+        node = lineage("x", "SELECT t.s.a AS x FROM tbl AS t", dialect="bigquery")
+        self.assertEqual(self._leaf_names(node), ["t.s.a"])
+
+        node = lineage("x", "SELECT t.s.a.b.c AS x FROM tbl AS t", dialect="bigquery")
+        self.assertEqual(self._leaf_names(node), ["t.s.a.b.c"])
+
+    def test_lineage_plain_column_unchanged_by_struct_handling(self) -> None:
+        # A column with no struct access must be unaffected (regression guard).
+        node = lineage("x", "SELECT a AS x FROM tbl", dialect="bigquery")
+        self.assertEqual(self._leaf_names(node), ["tbl.a"])
