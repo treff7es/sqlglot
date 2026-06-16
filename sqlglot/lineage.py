@@ -20,6 +20,25 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger("sqlglot")
 
 
+def _struct_access_root(column: exp.Column) -> exp.Expression:
+    """Return the maximal struct-field access rooted at ``column``.
+
+    Lineage treats an ``exp.Column`` as the unit of source attribution, but
+    struct/JSON field access (``t.s.metric.a``) is represented as a chain of
+    ``exp.Dot`` nodes wrapping the column. The bare column renders as ``t.s``,
+    so the ``.metric.a`` suffix is otherwise lost on the resulting leaf node.
+
+    Walking up the left spine of the Dot chain yields the full access
+    expression, so two distinct subfield accesses of the same column
+    (``t.s.a`` vs ``t.s.b``) stay distinct instead of collapsing. For a plain
+    column with no Dot parent this returns the column unchanged.
+    """
+    node: exp.Expression = column
+    while isinstance(node.parent, exp.Dot) and node.parent.this is node:
+        node = node.parent
+    return node
+
+
 @dataclass(frozen=True)
 class Node:
     name: str
@@ -361,11 +380,17 @@ def to_node(
                 on_node(star_node)
 
     # Find all columns that went into creating this one to list their lineage nodes.
-    source_columns = set(find_all_in_scope(select, exp.Column))
+    # Dedupe by the full struct-access path (e.g. "t.s.a" vs "t.s.b") rather than by
+    # the bare column, so distinct subfield accesses of the same column don't collapse
+    # into a single leaf. Insertion order is preserved for deterministic output.
+    source_columns: t.Dict[str, exp.Column] = {}
+    for column in find_all_in_scope(select, exp.Column):
+        source_columns.setdefault(_struct_access_root(column).sql(comments=False), column)
 
     # If the source is a UDTF find columns used in the UDTF to generate the table
     if isinstance(source, exp.UDTF):
-        source_columns |= set(source.find_all(exp.Column))
+        for column in source.find_all(exp.Column):
+            source_columns.setdefault(_struct_access_root(column).sql(comments=False), column)
         derived_tables: Sequence[exp.Expr] = [
             src.expression.parent
             for src in scope.sources.values()
@@ -395,7 +420,7 @@ def to_node(
                 if pre in pivot_column_mapping
             }
 
-    for c in source_columns:
+    for c in source_columns.values():
         table = c.table
         col_source: exp.Table | Scope | None = scope.sources.get(table)
 
@@ -486,7 +511,13 @@ def to_node(
             # is unknown. This can happen if the definition of a source used in a query is not
             # passed into the `sources` map.
             col_expr = col_source or exp.Placeholder()
-            leaf = Node(name=c.sql(comments=False), source=col_expr, expression=col_expr)
+            # Name the leaf by the full struct-access path (e.g. "t.s.metric.a")
+            # rather than the bare column, so nested field lineage is preserved.
+            leaf = Node(
+                name=_struct_access_root(c).sql(comments=False),
+                source=col_expr,
+                expression=col_expr,
+            )
             node.downstream.append(leaf)
             if on_node:
                 on_node(leaf)
