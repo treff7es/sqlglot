@@ -383,14 +383,16 @@ def to_node(
     # Dedupe by the full struct-access path (e.g. "t.s.a" vs "t.s.b") rather than by
     # the bare column, so distinct subfield accesses of the same column don't collapse
     # into a single leaf. Insertion order is preserved for deterministic output.
-    source_columns: t.Dict[str, exp.Column] = {}
-    for column in find_all_in_scope(select, exp.Column):
-        source_columns.setdefault(_struct_access_root(column).sql(comments=False), column)
+    source_columns: dict[str, exp.Column] = {}
+    for src_column in find_all_in_scope(select, exp.Column):
+        source_columns.setdefault(_struct_access_root(src_column).sql(comments=False), src_column)
 
     # If the source is a UDTF find columns used in the UDTF to generate the table
     if isinstance(source, exp.UDTF):
-        for column in source.find_all(exp.Column):
-            source_columns.setdefault(_struct_access_root(column).sql(comments=False), column)
+        for src_column in source.find_all(exp.Column):
+            source_columns.setdefault(
+                _struct_access_root(src_column).sql(comments=False), src_column
+            )
         derived_tables: Sequence[exp.Expr] = [
             src.expression.parent
             for src in scope.sources.values()
