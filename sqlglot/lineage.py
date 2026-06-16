@@ -20,7 +20,7 @@ if t.TYPE_CHECKING:
 logger = logging.getLogger("sqlglot")
 
 
-def _struct_access_root(column: exp.Column) -> exp.Expression:
+def _struct_access_root(column: exp.Column) -> exp.Expr:
     """Return the maximal struct-field access rooted at ``column``.
 
     Lineage treats an ``exp.Column`` as the unit of source attribution, but
@@ -33,10 +33,62 @@ def _struct_access_root(column: exp.Column) -> exp.Expression:
     (``t.s.a`` vs ``t.s.b``) stay distinct instead of collapsing. For a plain
     column with no Dot parent this returns the column unchanged.
     """
-    node: exp.Expression = column
+    node: exp.Expr = column
     while isinstance(node.parent, exp.Dot) and node.parent.this is node:
         node = node.parent
     return node
+
+
+def _subfield_path(column: exp.Column) -> str:
+    """Return the dotted struct-field path applied to ``column``.
+
+    For ``t.widget.metric.a`` this is ``"metric.a"``; for a plain column with no
+    struct access it is ``""``. Mirrors the left-spine walk of
+    ``_struct_access_root`` but collects the accessed field names.
+    """
+    parts: list[str] = []
+    node: exp.Expr = column
+    while isinstance(node.parent, exp.Dot) and node.parent.this is node:
+        node = node.parent
+        parts.append(node.expression.name)
+    return ".".join(parts)
+
+
+def _narrow_struct_field(value: exp.Expr, subfield: str) -> tuple[exp.Expr, str]:
+    """Descend a struct constructor to the field selected by ``subfield``.
+
+    Matches each path segment against the field names of an ``exp.Struct``
+    constructor (``STRUCT(x AS a, y AS b)``) and descends into the matching
+    field, consuming segments through arbitrarily nested structs. Returns the
+    narrowed expression and the unconsumed remainder of the path.
+
+    Resolution is purely structural, so it works with or without a schema. An
+    unmatched segment stops the descent and returns what was reached so far,
+    letting the caller fall back to whole-struct attribution.
+    """
+    if not subfield:
+        return value, ""
+
+    segments = subfield.split(".")
+    index = 0
+    current = value
+    while index < len(segments) and isinstance(current, exp.Struct):
+        matched: exp.Expr | None = None
+        for struct_field in current.expressions:
+            if (
+                isinstance(struct_field, exp.PropertyEQ)
+                and struct_field.this.name == segments[index]
+            ):
+                matched = struct_field.expression
+                break
+        if matched is None:
+            # Unmatched field name: degrade to whole-struct attribution and drop
+            # the unresolved path so it isn't appended to leaves as a bogus field.
+            return value, ""
+        current = matched
+        index += 1
+
+    return current, ".".join(segments[index:])
 
 
 @dataclass(frozen=True)
@@ -222,11 +274,12 @@ def to_node(
     reference_node_name: str | None = None,
     trim_selects: bool = True,
     schema: Schema | None = None,
+    subfield: str = "",
     _cache: dict[tuple, Node] | None = None,
     _scope_meta: dict[int, tuple[bool, dict[str, exp.Expr]]] | None = None,
     on_node: t.Callable[[Node], None] | None = None,
 ) -> Node:
-    cache_key = (column, id(scope), scope_name, source_name, reference_node_name)
+    cache_key = (column, id(scope), scope_name, source_name, reference_node_name, subfield)
 
     if _cache is not None and cache_key in _cache:
         cached_node = _cache[cache_key]
@@ -262,6 +315,16 @@ def to_node(
                 _scope_meta[scope_id] = meta
             is_star, select_by_name = meta
             select = select_by_name.get(column, exp.Star() if is_star else scope.expression)
+
+    # When a struct subfield was requested, narrow a struct constructor to the
+    # selected field so only that field's source columns are attributed (instead
+    # of every field of the struct). `search_expr` drives source-column discovery
+    # below; `remaining_subfield` is the unconsumed path passed further upstream.
+    search_expr: exp.Expr = select
+    remaining_subfield = subfield
+    if subfield:
+        value = select.this if isinstance(select, exp.Alias) else select
+        search_expr, remaining_subfield = _narrow_struct_field(value, subfield)
 
     if isinstance(scope.expression, exp.Subquery):
         for inner_scope in scope.subquery_scopes:
@@ -351,7 +414,7 @@ def to_node(
         id(subquery_scope.expression): subquery_scope for subquery_scope in scope.subquery_scopes
     }
 
-    for subquery in find_all_in_scope(select, *exp.UNWRAPPED_QUERIES):
+    for subquery in find_all_in_scope(search_expr, *exp.UNWRAPPED_QUERIES):
         subquery_scope: Scope | None = subquery_scopes.get(id(subquery))
         if not subquery_scope:
             logger.warning(f"Unknown subquery scope: {subquery.sql(dialect=dialect)}")
@@ -384,7 +447,7 @@ def to_node(
     # the bare column, so distinct subfield accesses of the same column don't collapse
     # into a single leaf. Insertion order is preserved for deterministic output.
     source_columns: dict[str, exp.Column] = {}
-    for src_column in find_all_in_scope(select, exp.Column):
+    for src_column in find_all_in_scope(search_expr, exp.Column):
         source_columns.setdefault(_struct_access_root(src_column).sql(comments=False), src_column)
 
     # If the source is a UDTF find columns used in the UDTF to generate the table
@@ -435,6 +498,9 @@ def to_node(
                 reference_node_name = selected_node.name if selected_node else None
 
             # The table itself came from a more specific scope. Recurse into that one using the unaliased column name.
+            # Carry the struct-field path so the upstream scope can narrow to the
+            # exact field: the column's own access path (e.g. "metric.a"), or the
+            # residual path left over when this column is a struct passthrough.
             to_node(
                 c.name,
                 scope=col_source,
@@ -445,6 +511,7 @@ def to_node(
                 reference_node_name=reference_node_name,
                 trim_selects=trim_selects,
                 schema=schema,
+                subfield=_subfield_path(c) or remaining_subfield,
                 _cache=_cache,
                 _scope_meta=_scope_meta,
                 on_node=on_node,
@@ -515,8 +582,13 @@ def to_node(
             col_expr = col_source or exp.Placeholder()
             # Name the leaf by the full struct-access path (e.g. "t.s.metric.a")
             # rather than the bare column, so nested field lineage is preserved.
+            # Append any residual subfield left over when this column is a struct
+            # passthrough whose field access happened in a downstream scope.
+            leaf_name = _struct_access_root(c).sql(comments=False)
+            if remaining_subfield:
+                leaf_name = f"{leaf_name}.{remaining_subfield}"
             leaf = Node(
-                name=_struct_access_root(c).sql(comments=False),
+                name=leaf_name,
                 source=col_expr,
                 expression=col_expr,
             )

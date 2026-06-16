@@ -1170,3 +1170,73 @@ class TestLineage(unittest.TestCase):
         # A column with no struct access must be unaffected (regression guard).
         node = lineage("x", "SELECT a AS x FROM tbl", dialect="bigquery")
         self.assertEqual(self._leaf_names(node), ["tbl.a"])
+
+    def test_lineage_struct_field_through_cte_narrows(self) -> None:
+        # A struct field accessed through a CTE must resolve only to the
+        # constructor field it selects, not to every field of the struct.
+        node = lineage(
+            "x",
+            "WITH r AS (SELECT STRUCT(t.a AS a, t.b AS b) AS sc FROM t) SELECT sc.a AS x FROM r",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.a"])
+
+        node = lineage(
+            "x",
+            "WITH r AS (SELECT STRUCT(t.a AS a, t.b AS b) AS sc FROM t) SELECT sc.b AS x FROM r",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.b"])
+
+    def test_lineage_struct_passthrough_column_through_cte(self) -> None:
+        # The CTE passes a whole struct column through; the outer query selects a
+        # field. The residual field path must land on the base-table leaf.
+        node = lineage(
+            "x",
+            "WITH r AS (SELECT t.s AS sc FROM t) SELECT sc.a AS x FROM r",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.s.a"])
+
+    def test_lineage_unnest_struct_field(self) -> None:
+        # Accessing a field of an unnested array-of-structs element must
+        # attribute to that field of the array column, not the whole array.
+        node = lineage(
+            "x",
+            "SELECT u.a AS x FROM t, UNNEST(t.arr) AS u",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.arr.a"])
+
+    def test_lineage_nested_struct_field_through_cte(self) -> None:
+        # Narrowing must descend through multiple nested struct constructors,
+        # consuming one path segment per level.
+        node = lineage(
+            "x",
+            "WITH r AS (SELECT STRUCT(STRUCT(t.x AS inner_f) AS outer_f) AS sc FROM t) "
+            "SELECT sc.outer_f.inner_f AS x FROM r",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.x"])
+
+    def test_lineage_struct_field_through_chained_ctes(self) -> None:
+        # The field path must survive narrowing across more than one CTE hop.
+        node = lineage(
+            "x",
+            "WITH r1 AS (SELECT STRUCT(t.a AS a, t.b AS b) AS sc FROM t), "
+            "r2 AS (SELECT sc AS sc FROM r1) "
+            "SELECT sc.a AS x FROM r2",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.a"])
+
+    def test_lineage_struct_unmatched_field_falls_back(self) -> None:
+        # An unmatched field name must not raise; it degrades to attributing the
+        # whole struct rather than failing.
+        node = lineage(
+            "x",
+            "WITH r AS (SELECT STRUCT(t.a AS a, t.b AS b) AS sc FROM t) "
+            "SELECT sc.missing AS x FROM r",
+            dialect="bigquery",
+        )
+        self.assertEqual(self._leaf_names(node), ["t.a", "t.b"])
